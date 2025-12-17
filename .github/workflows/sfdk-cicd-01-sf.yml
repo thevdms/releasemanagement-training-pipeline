@@ -72,7 +72,7 @@ on:
       docker_image:
         description: "Docker image to use"
         required: false
-        default: "ghcr.io/gsa-gen/crm-agdigipolis-pipeline/crm-agdigipolis-pipeline:latest"
+        default: "ghcr.io/thevdms/release-management-training-pipeline/release-management-training-pipeline:latest"
         type: string
 
       # Workflow options
@@ -144,7 +144,7 @@ jobs:
 
       - name: 🔐 Authenticate to Salesforce
         id: auth
-        uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-authenticate@v2
+        uses: thevdms/release-management-training-pipeline/.github/actions/sfdk-authenticate@v2
         with:
           auth_method: ${{ inputs.auth_method }}
           sf_username: ${{ inputs.sf_username }}
@@ -157,7 +157,7 @@ jobs:
       - name: 🔍 Run Code Analysis
         id: scan
         if: inputs.enable_code_scan
-        uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-sf-code-analyze@v2
+        uses: thevdms/release-management-training-pipeline/.github/actions/sfdk-sf-code-analyze@v2
         with:
           source_path: ${{ inputs.source_path }}
           severity_threshold: ${{ inputs.scan_severity_threshold }}
@@ -166,8 +166,8 @@ jobs:
 
       - name: 🚀 Execute Salesforce Operation
         id: deploy
-        # uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-deploy-and-parse@v2
-        uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-sf-project-deploy@v2
+        # uses: thevdms/release-management-training-pipeline/.github/actions/sfdk-deploy-and-parse@v2
+        uses: thevdms/release-management-training-pipeline/.github/actions/sfdk-sf-project-deploy@v2
         with:
           operation_type: ${{ inputs.operation_type }}
           target_org: "target-org"

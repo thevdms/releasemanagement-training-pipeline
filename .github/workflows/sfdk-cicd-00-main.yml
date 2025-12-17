@@ -10,7 +10,7 @@ on:
       docker-image:
         description: "Docker image to use"
         required: false
-        default: "ghcr.io/gsa-gen/crm-agdigipolis-pipeline/crm-agdigipolis-pipeline:latest"
+        default: "ghcr.io/thevdms/release-management-training-pipeline/release-management-training-pipeline:latest"
         type: string
       notification-medium:
         description: "Notification medium to use (none, teams, slack, webhook)"
@@ -84,13 +84,13 @@ jobs:
 
       - name: 📋 Load Configuration
         id: config
-        uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-load-config@v2
+        uses: thevdms/release-management-training-pipeline/.github/actions/sfdk-load-config@v2
 
   # Main CI/CD execution using optimized reusable workflow
   sf-cicd:
     name: 🚀 Salesforce CI/CD Execution
     needs: setup
-    uses: gsa-gen/crm-agdigipolis-pipeline/.github/workflows/sfdk-cicd-01-sf.yml@v2
+    uses: thevdms/release-management-training-pipeline/.github/workflows/sfdk-cicd-01-sf.yml@v2
     with:
       # Authentication
       auth_method: "sfdx-url"
