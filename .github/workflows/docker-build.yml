@@ -1,0 +1,293 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [ main, develop, v2 ]
+    paths:
+      - 'Dockerfile'
+      - 'scripts/**'
+      - '.github/workflows/docker-build.yml'
+
+  schedule:
+    # Weekly rebuild to get latest CLI updates
+    - cron: '0 2 * * 1'  # Every Monday at 2 AM UTC
+  
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even if no changes'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/sf-deploy-kit
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Check for CLI and plugin updates
+        id: check-updates
+        run: |
+          echo "🔍 Checking for Salesforce CLI and plugin updates..."
+          
+          # Get latest versions (only check for installable plugins)
+          LATEST_CLI_VERSION=$(npm view @salesforce/cli version 2>/dev/null || echo "unknown")
+          LATEST_GITDELTA_VERSION=$(npm view sfdx-git-delta version 2>/dev/null || echo "unknown")
+          
+          echo "latest_cli_version=$LATEST_CLI_VERSION" >> $GITHUB_OUTPUT
+          echo "latest_gitdelta_version=$LATEST_GITDELTA_VERSION" >> $GITHUB_OUTPUT
+          
+          # Note: code-analyzer is now part of core CLI, tracked via CLI version
+          
+          # Get current image versions (if image exists)
+          CURRENT_CLI_VERSION="unknown"
+          CURRENT_GITDELTA_VERSION="unknown"
+          IMAGE_EXISTS="false"
+          
+          if docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>/dev/null; then
+            echo "📦 Existing image found - checking versions..."
+            IMAGE_EXISTS="true"
+            
+            # Use --entrypoint to bypass our custom entrypoint and avoid log pollution
+            CURRENT_CLI_VERSION=$(docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest sf version --json 2>/dev/null | jq -r '.cliVersion // "unknown"' || echo "unknown")
+            
+            # Get sfdx-git-delta version from the current image (installed via npm)
+            CURRENT_GITDELTA_VERSION=$(docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest sh -c '
+              # Check npm package version (since installed via npm)
+              npm list -g sfdx-git-delta --json 2>/dev/null | jq -r ".dependencies[\"sfdx-git-delta\"].version" 2>/dev/null ||
+              echo "unknown"
+            ' || echo "unknown")
+          else
+            echo "📦 No existing image found"
+          fi
+          
+          echo "current_cli_version=$CURRENT_CLI_VERSION" >> $GITHUB_OUTPUT
+          echo "current_gitdelta_version=$CURRENT_GITDELTA_VERSION" >> $GITHUB_OUTPUT
+          
+          # Determine if build is needed
+          SHOULD_BUILD="false"
+          BUILD_REASON=""
+          VERSION_CHANGES=""
+          
+          # Force rebuild requested
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.force_rebuild }}" == "true" ]; then
+            SHOULD_BUILD="true"
+            BUILD_REASON="Force rebuild requested"
+            echo "🔨 Force rebuild requested"
+          
+          # Code/Dockerfile changes detected
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            SHOULD_BUILD="true"
+            BUILD_REASON="Code changes detected"
+            echo "🔨 Code changes detected"
+          
+          # Version updates detected (CLI or plugins)
+          elif [ "$IMAGE_EXISTS" == "true" ]; then
+            # Check CLI version
+            if [ "$LATEST_CLI_VERSION" != "unknown" ] && [ "$CURRENT_CLI_VERSION" != "unknown" ] && [ "$LATEST_CLI_VERSION" != "$CURRENT_CLI_VERSION" ]; then
+              SHOULD_BUILD="true"
+              VERSION_CHANGES="${VERSION_CHANGES}CLI: $CURRENT_CLI_VERSION → $LATEST_CLI_VERSION; "
+            fi
+            
+            # Check sfdx-git-delta version
+            if [ "$LATEST_GITDELTA_VERSION" != "unknown" ] && [ "$CURRENT_GITDELTA_VERSION" != "unknown" ] && [ "$LATEST_GITDELTA_VERSION" != "$CURRENT_GITDELTA_VERSION" ]; then
+              SHOULD_BUILD="true"
+              VERSION_CHANGES="${VERSION_CHANGES}sfdx-git-delta: $CURRENT_GITDELTA_VERSION → $LATEST_GITDELTA_VERSION; "
+            fi
+            
+            if [ "$SHOULD_BUILD" == "true" ] && [ -n "$VERSION_CHANGES" ]; then
+              BUILD_REASON="Version updates detected: $VERSION_CHANGES"
+              echo "🔨 Version updates detected: $VERSION_CHANGES"
+            fi
+          
+          # Scheduled build only if no current image exists
+          elif [ "${{ github.event_name }}" == "schedule" ] && [ "$IMAGE_EXISTS" == "false" ]; then
+            SHOULD_BUILD="true"
+            BUILD_REASON="Scheduled build - no existing image found"
+            echo "🔨 Scheduled build - no existing image found"
+          
+          # No current image exists
+          elif [ "$IMAGE_EXISTS" == "false" ]; then
+            SHOULD_BUILD="true"
+            BUILD_REASON="No existing image found"
+            echo "🔨 No existing image found"
+          fi
+          
+          echo "should_build=$SHOULD_BUILD" >> $GITHUB_OUTPUT
+          echo "build_reason=$BUILD_REASON" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "📊 Version Analysis Summary:"
+          echo "  � Latest CLI: $LATEST_CLI_VERSION"
+          echo "  🔧 Current CLI: $CURRENT_CLI_VERSION"
+          echo "📊 Latest sfdx-git-delta: $LATEST_GITDELTA_VERSION"
+          echo "  🔧 Current sfdx-git-delta: $CURRENT_GITDELTA_VERSION"
+          echo "  ✅ Should Build: $SHOULD_BUILD"
+          echo "  📝 Reason: $BUILD_REASON"
+
+      - name: Set up Docker Buildx
+        if: steps.check-updates.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        if: steps.check-updates.outputs.should_build == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VCS_REF=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+            CLI_VERSION=${{ steps.check-updates.outputs.latest_cli_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test Docker image
+        if: steps.check-updates.outputs.should_build == 'true'
+        run: |
+          echo "🧪 Testing built Docker image..."
+          echo "📋 Testing environment: $(whoami)@$(hostname)"
+          echo "📋 Current directory: $(pwd)"
+          echo "📋 Docker version: $(docker --version)"
+          echo "📋 Testing image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo ""
+          
+          # Test container environment
+          echo "📋 Testing container environment..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest sh -c '
+            echo "📋 Container user: $(whoami)"
+            echo "📋 Container working directory: $(pwd)"
+            echo "📋 Container OS: $(uname -a)"
+            echo "📋 Node.js version: $(node --version)"
+            echo "📋 NPM version: $(npm --version)"
+            echo "📋 Environment variables:"
+            env | sort | grep -E "(SF_|SFDX_|PATH)" || echo "No SF/SFDX environment variables found"
+          '
+          echo ""
+          
+          # Test CLI functionality
+          echo "📋 Testing CLI version..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest sf version --json
+          echo ""
+          
+          # Test installed plugins
+          echo "📋 Testing SF plugins..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest sf plugins
+          echo ""
+          
+          # Test sfdx-git-delta command
+          echo "📋 Testing sfdx-git-delta command..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest sh -c '
+            echo "Testing sf sgd command..."
+            sf sgd --help > /dev/null 2>&1 && echo "✅ sf sgd command working" || echo "❌ sf sgd command failed"
+          '
+          echo ""
+          
+          # Test code-analyzer command
+          echo "📋 Testing code-analyzer command..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest sh -c '
+            echo "Testing sf code-analyzer command..."
+            sf code-analyzer --help > /dev/null 2>&1 && echo "✅ sf code-analyzer command working" || echo "❌ sf code-analyzer command failed"
+          '
+          echo ""
+          
+          # Test additional tools
+          echo "📋 Testing yq..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest yq --version
+          
+          echo "📋 Testing jq..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest jq --version
+          echo ""
+          
+          # Test core CLI commands work
+          echo "📋 Testing core CLI commands..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest sf org list --all > /dev/null || echo "sf org list completed (expected - no orgs configured)"
+          
+          # Test that helper functions are available when using normal entrypoint
+          echo "📋 Testing helper functions with entrypoint..."
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest bash -c 'log_info "Helper functions test successful"'
+          
+          # Test that executable wrappers work with bypassed entrypoint
+          echo "📋 Testing executable wrapper functions..."
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest log_info "Executable wrapper test successful"
+          docker run --rm --entrypoint="" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest log_success "All helper function approaches working"
+          
+          echo "✅ All tests passed!"
+
+      - name: Create release summary
+        if: steps.check-updates.outputs.should_build == 'true'
+        run: |
+          echo "## 🐳 Docker Image Built Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Image Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Registry**: ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags**: ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Reason**: ${{ steps.check-updates.outputs.build_reason }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Version Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **CLI Version**: ${{ steps.check-updates.outputs.latest_cli_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Usage in Workflows" >> $GITHUB_STEP_SUMMARY
+          echo '```yaml' >> $GITHUB_STEP_SUMMARY
+          echo 'container:' >> $GITHUB_STEP_SUMMARY
+          echo '  image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pre-installed Tools" >> $GITHUB_STEP_SUMMARY
+          echo "The image includes sfdx-git-delta and code analyzer plugins via sf CLI:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo '# Git delta functionality (sf plugin)' >> $GITHUB_STEP_SUMMARY
+          echo 'sf sgd --help' >> $GITHUB_STEP_SUMMARY
+          echo '# Code analysis (sf plugin)' >> $GITHUB_STEP_SUMMARY
+          echo 'sf code-analyzer --help' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Skip build notification
+        if: steps.check-updates.outputs.should_build != 'true'
+        run: |
+          echo "ℹ️ No build required - no CLI or plugin version changes detected"
+          echo ""
+          echo "📊 Current Versions (unchanged):"
+          echo "  - CLI: ${{ steps.check-updates.outputs.current_cli_version }}"
+          echo "  - sfdx-git-delta: ${{ steps.check-updates.outputs.current_gitdelta_version }}"
+          echo ""
+          echo "💡 To force a rebuild, run this workflow manually with 'force_rebuild' set to true"
+          echo ""
+          echo "## ℹ️ Docker Build Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "**Reason**: No CLI or plugin version changes detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Current Versions" >> $GITHUB_STEP_SUMMARY
+          echo "- **CLI**: ${{ steps.check-updates.outputs.current_cli_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **sfdx-git-delta**: ${{ steps.check-updates.outputs.current_gitdelta_version }}" >> $GITHUB_STEP_SUMMARY

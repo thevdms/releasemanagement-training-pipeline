@@ -1,0 +1,173 @@
+name: "SFDK - Authenticate to Salesforce"
+description: "Streamlined Salesforce authentication with multiple methods"
+author: "Teja Narala <tenarala@deloitte.com>"
+
+inputs:
+  auth_method:
+    description: "Authentication method (jwt, sfdx-url)"
+    required: false
+    default: "sfdx-url"
+
+  sf_username:
+    description: "Salesforce username"
+    required: true
+
+  sf_instance_url:
+    description: "Salesforce instance URL"
+    required: true
+
+  target_org_alias:
+    description: "Alias for the target org"
+    required: false
+    default: "target-org"
+
+  sf_client_id:
+    description: "Salesforce connected app client ID"
+    required: false
+
+  sf_private_key:
+    description: "JWT private key for authentication"
+    required: false
+
+  sfdx_auth_url:
+    description: "SFDX auth URL for authentication"
+    required: false
+
+outputs:
+  auth_status:
+    description: "Authentication status (success/failed)"
+    value: ${{ steps.verify.outputs.auth_status }}
+  org_id:
+    description: "Salesforce org ID"
+    value: ${{ steps.verify.outputs.org_id }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: � Initialize Authentication
+      id: init
+      shell: bash
+      run: |
+        log_info "🔐 Initializing Salesforce authentication..."
+        log_info "📋 Method: ${{ inputs.auth_method }}"
+        log_info "👤 Username: ${{ inputs.sf_username }}"
+        log_info "🌐 Instance: ${{ inputs.sf_instance_url }}"
+        log_info "🎯 Target Alias: ${{ inputs.target_org_alias }}"
+
+    - name: 🔑 Authenticate via JWT
+      if: inputs.auth_method == 'jwt'
+      shell: bash
+      run: |
+        log_warning "🔑 Using JWT authentication"
+
+        if [ -z "${{ inputs.sf_private_key }}" ] || [ -z "${{ inputs.sf_client_id }}" ]; then
+          log_failure "Missing JWT credentials (client_id or private_key)"
+          exit 1
+        fi
+
+        log_info "Creating temporary private key file..."
+        echo "${{ inputs.sf_private_key }}" > /tmp/private.key
+
+        log_info "Authenticating with JWT..."
+        sf org login jwt \
+          --client-id "${{ inputs.sf_client_id }}" \
+          --jwt-key-file /tmp/private.key \
+          --username "${{ inputs.sf_username }}" \
+          --instance-url "${{ inputs.sf_instance_url }}" \
+          --alias "${{ inputs.target_org_alias }}"
+
+        rm -f /tmp/private.key
+        log_success "JWT authentication completed"
+
+    - name: 🔗 Authenticate via SFDX URL
+      if: inputs.auth_method == 'sfdx-url'
+      shell: bash
+      run: |
+        log_warning "🔗 Using SFDX URL authentication"
+
+        if [ -z "${{ inputs.sfdx_auth_url }}" ]; then
+          log_failure "Missing SFDX auth URL"
+          exit 1
+        fi
+
+        echo "${{ inputs.sfdx_auth_url }}" > /tmp/sfdx_auth_url.txt
+
+        log_info "Authenticating with SFDX URL..."
+        sf org login sfdx-url \
+          --sfdx-url-file /tmp/sfdx_auth_url.txt \
+          --alias "${{ inputs.target_org_alias }}"
+
+        rm -f /tmp/sfdx_auth_url.txt
+        log_success "SFDX URL authentication completed"
+
+    - name: 🔍 Verify Authentication
+      id: verify
+      shell: bash
+      run: |
+        log_info "🔍 Verifying authentication..."
+
+        # Get org information
+        ORG_INFO=$(sf org display --target-org "${{ inputs.target_org_alias }}" --json)
+
+        if [ $? -ne 0 ]; then
+          log_failure "Authentication verification failed"
+          echo "auth_status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+        # Extract org details
+        ORG_ID=$(echo "$ORG_INFO" | jq -r '.result.id // "unknown"')
+        API_VERSION=$(echo "$ORG_INFO" | jq -r '.result.apiVersion // "unknown"')
+        CONNECTED_STATUS=$(echo "$ORG_INFO" | jq -r '.result.connectedStatus // "unknown"')
+
+        log_success "Authentication verification successful"
+        log_info "🆔 Org ID: $ORG_ID"
+        log_info "🔌 Connected Status: $CONNECTED_STATUS"
+        log_info "📡 API Version: $API_VERSION"
+
+        # Set outputs
+        echo "auth_status=success" >> $GITHUB_OUTPUT
+        echo "org_id=$ORG_ID" >> $GITHUB_OUTPUT
+        echo "org_type=$CONNECTED_STATUS" >> $GITHUB_OUTPUT
+
+    - name: 📊 Generate Summary
+      if: always()
+      shell: bash
+      run: |
+        AUTH_STATUS="${{ steps.verify.outputs.auth_status }}"
+
+        if [ "$AUTH_STATUS" = "success" ]; then
+          ORG_ID="${{ steps.verify.outputs.org_id }}"
+          CONNECTED_STATUS="${{ steps.verify.outputs.org_type }}"
+          
+          # Get API version from org info again (since we can't pass between steps easily)
+          ORG_INFO=$(sf org display --target-org "${{ inputs.target_org_alias }}" --json 2>/dev/null)
+          API_VERSION=$(echo "$ORG_INFO" | jq -r '.result.apiVersion // "unknown"' 2>/dev/null || echo "unknown")
+          
+          {
+            echo "# 🔐 Authentication Success"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| 🎯 Target Org | ${{ inputs.target_org_alias }} |"
+            echo "| 👤 Username | ${{ inputs.sf_username }} |"
+            echo "| 🌐 Instance URL | ${{ inputs.sf_instance_url }} |"
+            echo "| 🆔 Org ID | $ORG_ID |"
+            echo "| 🔌 Connected Status | $CONNECTED_STATUS |"
+            echo "| 📡 API Version | $API_VERSION |"
+            echo "| 🔑 Auth Method | ${{ inputs.auth_method }} |"
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+        else
+          {
+            echo "# ❌ Authentication Failed"
+            echo ""
+            echo "**Authentication could not be verified.** Please check:"
+            echo "- Credentials are correct"
+            echo "- Instance URL is accessible"
+            echo "- Connected app permissions (for JWT)"
+            echo ""
+            echo "**Method attempted:** ${{ inputs.auth_method }}"
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+        fi

@@ -1,0 +1,120 @@
+name: "SFDK - Main CI/CD Workflow"
+on:
+  workflow_call:
+    inputs:
+      source-path:
+        description: "Source path for deployment"
+        required: false
+        default: "force-app"
+        type: string
+      docker-image:
+        description: "Docker image to use"
+        required: false
+        default: "ghcr.io/gsa-gen/crm-agdigipolis-pipeline/crm-agdigipolis-pipeline:latest"
+        type: string
+      notification-medium:
+        description: "Notification medium to use (none, teams, slack, webhook)"
+        required: false
+        default: "teams"
+        type: string
+      notification-on-success:
+        description: "Send notification on successful operations"
+        required: false
+        default: true
+        type: boolean
+      notification-on-failure:
+        description: "Send notification on failed operations"
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      SF_CLIENT_ID:
+        description: "Salesforce Connected App Client ID"
+        required: false
+      SF_PRIVATE_KEY:
+        description: "Salesforce Connected App Private Key"
+        required: false
+      SF_SFDX_AUTH_URL:
+        description: "Salesforce SFDX Auth URL"
+        required: false
+      TEAMS_WEBHOOK_URL:
+        description: "Microsoft Teams Webhook URL for notifications"
+        required: false
+      SLACK_WEBHOOK_URL:
+        description: "Slack Webhook URL for notifications"
+        required: false
+      WEBHOOK_URL:
+        description: "Generic Webhook URL for notifications"
+        required: false
+
+jobs:
+  # Setup job to determine environment and operation
+  setup:
+    name: 🔧 Setup Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      sf_instance_url: ${{ steps.config.outputs.sf_instance_url }}
+      sf_username: ${{ steps.config.outputs.sf_username }}
+      gh_environment: ${{ steps.config.outputs.gh_environment }}
+      sf_test_level: ${{ steps.config.outputs.sf_test_level }}
+      sf_test_level_pr: ${{ steps.config.outputs.sf_test_level_pr }}
+      sf_coverage_threshold: ${{ steps.config.outputs.sf_coverage_threshold }}
+      sf_code_analysis_enabled: ${{ steps.config.outputs.sf_code_analysis_enabled }}
+      sf_code_analysis_threshold: ${{ steps.config.outputs.sf_code_analysis_threshold }}
+      job_operation: ${{ steps.determine.outputs.operation }}
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .env/
+          sparse-checkout-cone-mode: false
+
+      - name: Determine operation
+        id: determine
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "operation=validate" >> $GITHUB_OUTPUT
+            echo "🔍 Operation: Pull Request Validation"
+          else
+            echo "operation=deploy" >> $GITHUB_OUTPUT
+            echo "🚀 Operation: Deployment"
+          fi
+
+      - name: 📋 Load Configuration
+        id: config
+        uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-load-config@v2
+
+  # Main CI/CD execution using optimized reusable workflow
+  sf-cicd:
+    name: 🚀 Salesforce CI/CD Execution
+    needs: setup
+    uses: gsa-gen/crm-agdigipolis-pipeline/.github/workflows/sfdk-cicd-01-sf.yml@v2
+    with:
+      # Authentication
+      auth_method: "sfdx-url"
+      sf_username: ${{ needs.setup.outputs.sf_username }}
+      sf_instance_url: ${{ needs.setup.outputs.sf_instance_url }}
+
+      # Operation
+      operation_type: ${{ needs.setup.outputs.job_operation }}
+      source_path: ${{ inputs.source-path }}
+      test_level: ${{ needs.setup.outputs.job_operation == 'validate' && needs.setup.outputs.sf_test_level_pr || needs.setup.outputs.sf_test_level }}
+      coverage_threshold: ${{ needs.setup.outputs.sf_coverage_threshold }}
+
+      # Code scanning
+      enable_code_scan: ${{ needs.setup.outputs.sf_code_analysis_enabled == 'true' }}
+      scan_severity_threshold: "3"
+      fail_on_scan_violations: false
+
+      # Docker
+      docker_image: ${{ inputs.docker-image }}
+
+      # Environment
+      github_environment: ${{ needs.setup.outputs.gh_environment }}
+
+    secrets:
+      SF_CLIENT_ID: ${{ secrets.SF_CLIENT_ID }}
+      SF_PRIVATE_KEY: ${{ secrets.SF_PRIVATE_KEY }}
+      SFDX_AUTH_URL: ${{ secrets.SF_SFDX_AUTH_URL }}

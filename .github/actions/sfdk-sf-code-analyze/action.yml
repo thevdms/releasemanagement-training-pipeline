@@ -1,0 +1,228 @@
+name: "SFDK - Code Scan and Parse"
+description: "Combined code scanning and results parsing with detailed violation analysis"
+
+inputs:
+  source_path:
+    description: "Source path for scanning"
+    required: false
+    default: "force-app"
+  severity_threshold:
+    description: "Code scan severity threshold (1-5)"
+    required: false
+    default: "3"
+  fail_on_violations:
+    description: "Fail on code scan violations"
+    required: false
+    default: "false"
+  target_org:
+    description: "Target org alias"
+    required: false
+    default: "target-org"
+
+outputs:
+  scan_status:
+    description: "Scan status (success/failed/skipped)"
+    value: ${{ steps.scan.outputs.scan_status }}
+  violations_count:
+    description: "Total number of violations"
+    value: ${{ steps.scan.outputs.violations_count }}
+  violations_by_severity:
+    description: "JSON object with violations by severity"
+    value: ${{ steps.scan.outputs.violations_by_severity }}
+  scan_results_file:
+    description: "Path to scan results JSON file"
+    value: ${{ steps.scan.outputs.scan_results_file }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: 🔍 Run Code Analysis and Parse Results
+      id: scan
+      shell: bash
+      run: |
+        # Helper functions are automatically available from /etc/bash.bashrc
+        log_info "🔍 Starting code analysis..."
+        log_info "📂 Source path: ${{ inputs.source_path }}"
+        log_info "⚡ Severity threshold: ${{ inputs.severity_threshold }}"
+
+        # Initialize outputs
+        SCAN_STATUS="failed"
+        VIOLATIONS_COUNT=0
+        VIOLATIONS_BY_SEVERITY='{"sev1":0,"sev2":0,"sev3":0,"sev4":0,"sev5":0}'
+        RESULTS_FILE="code-analysis-results.json"  # JSON for parsing and summary generation
+        HTML_FILE="code-analysis-results.html"    # HTML for artifact publishing
+
+        # Check if code analyzer is available
+        if ! sf code-analyzer --help > /dev/null 2>&1; then
+          log_failure "Code analyzer not available"
+          echo "scan_status=skipped" >> $GITHUB_OUTPUT
+          echo "violations_count=0" >> $GITHUB_OUTPUT
+          echo "violations_by_severity=$VIOLATIONS_BY_SEVERITY" >> $GITHUB_OUTPUT
+          echo "scan_results_file=" >> $GITHUB_OUTPUT
+          
+          {
+            echo "## 🔍 Code Analysis Skipped"
+            echo ""
+            echo "⚠️ **Code analyzer not available in this environment**"
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+          exit 0
+        fi
+
+        # Run code analysis
+        log_warning "🔎 Running code analyzer..."
+
+        export SF_LOG_LEVEL=4
+
+        # Use modern sf code-analyzer command to generate both outputs
+        # JSON file: For parsing violations and generating summary reports
+        # HTML file: For publishing as viewable artifact
+        SF_CMD="sf code-analyzer run --target ${{ inputs.source_path }} --severity-threshold ${{ inputs.severity_threshold }} --output-file $RESULTS_FILE --output-file $HTML_FILE"
+        
+        log_command "🔎 Executing Code Analysis" "$SF_CMD"
+
+        echo "::group::🔎 sf code-analyzer raw result"
+
+        set +e  # Don't exit on non-zero exit codes
+        sf code-analyzer run \
+          --target "${{ inputs.source_path }}" \
+          --severity-threshold "${{ inputs.severity_threshold }}" \
+          --output-file "$RESULTS_FILE" \
+          --output-file "$HTML_FILE"
+        EXIT_CODE=$?
+        set -e  # Re-enable exit on error
+        echo "::endgroup::"
+        
+        # Handle different exit codes according to Salesforce documentation
+        if [ $EXIT_CODE -eq 0 ]; then
+          log_success "Code analysis completed - no violations found"
+          SCAN_STATUS="success"
+        elif [ $EXIT_CODE -eq 2 ]; then
+          log_success "Code analysis completed - violations found that meet or exceed severity threshold"
+          SCAN_STATUS="success"  # Analysis was successful, just found violations
+        else
+          log_failure "Code analysis failed with exit code $EXIT_CODE"
+          SCAN_STATUS="failed"
+          echo '{"violations":[]}' > "$RESULTS_FILE"
+          
+          {
+            echo "## ❌ Code Analysis Failed"
+            echo ""
+            echo "**Code analysis could not complete successfully.**"
+            echo ""
+            echo "**Error Details:**"
+            echo "- Failed with sf code-analyzer command (exit code: $EXIT_CODE)"
+            echo "- This may be due to:"
+            echo "  - Invalid source path: \`${{ inputs.source_path }}\`"
+            echo "  - Code analyzer configuration issues"
+            echo "  - Unsupported severity threshold: \`${{ inputs.severity_threshold }}\`"
+            echo ""
+            echo "**Troubleshooting:**"
+            echo "1. Verify that the source path exists and contains Salesforce metadata"
+            echo "2. Check that the Code Analyzer plugin is properly installed"
+            echo "3. Verify the severity threshold is between 1-5"
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Parse JSON results file for violation analysis and summary generation
+        if [ "$SCAN_STATUS" = "success" ] && [ -f "$RESULTS_FILE" ]; then
+            log_info "📊 Parsing JSON results file for violation counts and summary..."
+            
+            # Parse using the actual JSON structure with violationCounts
+            VIOLATIONS_COUNT=$(jq -r '.violationCounts.total // 0' "$RESULTS_FILE" 2>/dev/null || echo "0")
+            SEV1=$(jq -r '.violationCounts.sev1 // 0' "$RESULTS_FILE" 2>/dev/null || echo "0")
+            SEV2=$(jq -r '.violationCounts.sev2 // 0' "$RESULTS_FILE" 2>/dev/null || echo "0")
+            SEV3=$(jq -r '.violationCounts.sev3 // 0' "$RESULTS_FILE" 2>/dev/null || echo "0")
+            SEV4=$(jq -r '.violationCounts.sev4 // 0' "$RESULTS_FILE" 2>/dev/null || echo "0")
+            SEV5=$(jq -r '.violationCounts.sev5 // 0' "$RESULTS_FILE" 2>/dev/null || echo "0")
+            
+            VIOLATIONS_BY_SEVERITY='{"sev1":'$SEV1',"sev2":'$SEV2',"sev3":'$SEV3',"sev4":'$SEV4',"sev5":'$SEV5'}'
+            
+            log_info "📋 Analysis Results (parsed from JSON):"
+            log_info "  Total violations: $VIOLATIONS_COUNT"
+            log_info "  Severity 1 (Critical): $SEV1"
+            log_info "  Severity 2 (High): $SEV2"
+            log_info "  Severity 3 (Medium): $SEV3"
+            log_info "  Severity 4 (Low): $SEV4"
+            log_info "  Severity 5 (Info): $SEV5"
+            
+            # Generate summary report from parsed JSON data
+            {
+              echo "# 🔍 Code Analysis Results"
+              echo ""
+              if [ "$VIOLATIONS_COUNT" -eq 0 ]; then
+                echo "✅ **No violations found!** Your code looks great."
+                echo ""
+                echo '```mermaid'
+                echo 'pie title Code Quality Status'
+                echo '    "Clean Code" : 100'
+                echo '```'
+              else
+                echo "⚠️ **Found $VIOLATIONS_COUNT violations**"
+                echo ""
+                
+                # Create Mermaid pie chart for violations breakdown
+                echo '```mermaid'
+                echo 'pie showData'
+                echo '    title Code Violations by Severity'
+                if [ "$SEV1" -gt 0 ]; then
+                  echo "    \"🔴 Critical (Sev1)\" : $SEV1"
+                fi
+                if [ "$SEV2" -gt 0 ]; then
+                  echo "    \"🟠 High (Sev2)\" : $SEV2"
+                fi
+                if [ "$SEV3" -gt 0 ]; then
+                  echo "    \"🟡 Medium (Sev3)\" : $SEV3"
+                fi
+                if [ "$SEV4" -gt 0 ]; then
+                  echo "    \"🔵 Low (Sev4)\" : $SEV4"
+                fi
+                if [ "$SEV5" -gt 0 ]; then
+                  echo "    \"⚪ Info (Sev5)\" : $SEV5"
+                fi
+                echo '```'
+                echo ""
+                
+                echo "| Severity | Count | Description |"
+                echo "|----------|-------|-------------|"
+                echo "| 🔴 Severity 1 | $SEV1 | Critical issues |"
+                echo "| 🟠 Severity 2 | $SEV2 | High priority issues |"
+                echo "| 🟡 Severity 3 | $SEV3 | Medium priority issues |"
+                echo "| 🔵 Severity 4 | $SEV4 | Low priority issues |"
+                echo "| ⚪ Severity 5 | $SEV5 | Informational |"
+                
+                # Determine overall assessment
+                if [ "$SEV1" -gt 0 ]; then
+                  echo ""
+                  echo "🚨 **Critical issues detected!** Please address severity 1 violations before deployment."
+                elif [ "$SEV2" -gt 0 ]; then
+                  echo ""
+                  echo "⚠️ **High priority issues found.** Consider addressing before deployment."
+                else
+                  echo ""
+                  echo "ℹ️ **Minor issues found.** Consider addressing during development."
+                fi
+              fi
+              echo ""
+            } >> $GITHUB_STEP_SUMMARY
+            
+        else
+          log_warning "⚠️ JSON results file not generated or scan failed - cannot parse violations"
+          VIOLATIONS_BY_SEVERITY='{"sev1":0,"sev2":0,"sev3":0,"sev4":0,"sev5":0}'
+        fi
+
+        # Set outputs (JSON file path for downstream parsing, HTML for artifacts)
+        echo "scan_status=$SCAN_STATUS" >> $GITHUB_OUTPUT
+        echo "violations_count=$VIOLATIONS_COUNT" >> $GITHUB_OUTPUT
+        echo "violations_by_severity=$VIOLATIONS_BY_SEVERITY" >> $GITHUB_OUTPUT
+        echo "scan_results_file=$RESULTS_FILE" >> $GITHUB_OUTPUT  # JSON file for further processing
+
+        # Check if we should fail on violations
+        if [ "${{ inputs.fail_on_violations }}" = "true" ] && [ "$VIOLATIONS_COUNT" -gt 0 ]; then
+          log_failure "Failing due to violations (fail_on_violations=true)"
+          echo "::error::Found $VIOLATIONS_COUNT code violations"
+          exit 1
+        fi
+
+        log_success "Code scan and parsing completed"

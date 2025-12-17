@@ -1,0 +1,593 @@
+name: "SFDK - SF Project Deploy"
+description: "Clean, modular Salesforce deployment with focused error analysis and test reporting"
+
+inputs:
+  operation_type:
+    description: "Operation type (deploy, validate, deploy-quick)"
+    required: false
+    default: "validate"
+  target_org:
+    description: "Target org alias"
+    required: true
+  source_path:
+    description: "Source path for deployment"
+    required: false
+    default: "force-app"
+  manifest_path:
+    description: "Path to package.xml manifest"
+    required: false
+  test_level:
+    description: "Test level (NoTestRun, RunSpecifiedTests, RunLocalTests, RunAllTestsInOrg)"
+    required: false
+    default: "RunLocalTests"
+  specified_tests:
+    description: "Comma-separated list of test classes to run"
+    required: false
+  wait_time:
+    description: "Wait time in minutes"
+    required: false
+    default: "30"
+  quick_deploy_id:
+    description: "Quick deploy ID for deploy-quick operation"
+    required: false
+  coverage_threshold:
+    description: "Code coverage threshold percentage"
+    required: false
+    default: "85"
+
+outputs:
+  deploy_status:
+    description: "Deployment status (success, failed, canceled)"
+    value: ${{ steps.execute.outputs.deploy_status }}
+  deploy_id:
+    description: "Deployment ID"
+    value: ${{ steps.execute.outputs.deploy_id }}
+  deploy_url:
+    description: "Deployment URL in Salesforce"
+    value: ${{ steps.execute.outputs.deploy_url }}
+  coverage_percentage:
+    description: "Overall code coverage percentage"
+    value: ${{ steps.execute.outputs.coverage_percentage }}
+  test_results:
+    description: "Test execution results summary"
+    value: ${{ steps.execute.outputs.test_results }}
+  has_component_errors:
+    description: "Whether component errors were detected"
+    value: ${{ steps.execute.outputs.has_component_errors }}
+  tests_executed:
+    description: "Whether tests were executed"
+    value: ${{ steps.execute.outputs.tests_executed }}
+  component_errors:
+    description: "Number of component errors"
+    value: ${{ steps.execute.outputs.component_errors }}
+  components_total:
+    description: "Total number of components"
+    value: ${{ steps.execute.outputs.components_total }}
+  test_failures:
+    description: "Number of test failures"
+    value: ${{ steps.execute.outputs.test_failures }}
+  tests_total:
+    description: "Total number of tests"
+    value: ${{ steps.execute.outputs.tests_total }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: 🚀 Execute Deployment
+      id: execute
+      shell: bash
+      run: |
+        # Helper functions are automatically available
+        log_info "🚀 Starting Salesforce ${{ inputs.operation_type }}..."
+        log_info "🎯 Target org: ${{ inputs.target_org }}"
+        log_info "📂 Source: ${{ inputs.source_path }}"
+        log_info "🧪 Test level: ${{ inputs.test_level }}"
+
+        # JSON parsing helpers
+        parse_json() {
+          local path="$1"
+          local default="$2"
+          echo "$DEPLOY_RESULT" | jq -r "$path // \"$default\"" 2>/dev/null || echo "$default"
+        }
+
+        # Build deployment command
+        case "${{ inputs.operation_type }}" in
+          "validate")
+            DEPLOY_CMD="sf project deploy start --dry-run"
+            ;;
+          "deploy-quick")
+            if [ -z "${{ inputs.quick_deploy_id }}" ]; then
+              log_failure "Quick deploy ID required for deploy-quick operation"
+              exit 1
+            fi
+            DEPLOY_CMD="sf project deploy quick --job-id ${{ inputs.quick_deploy_id }}"
+            ;;
+          *)
+            DEPLOY_CMD="sf project deploy start"
+            ;;
+        esac
+
+        # Add common parameters
+        DEPLOY_CMD="$DEPLOY_CMD --target-org ${{ inputs.target_org }} --wait ${{ inputs.wait_time }} --json"
+
+        # Add source or manifest
+        if [ -n "${{ inputs.manifest_path }}" ]; then
+          DEPLOY_CMD="$DEPLOY_CMD --manifest ${{ inputs.manifest_path }}"
+          log_info "📋 Using manifest: ${{ inputs.manifest_path }}"
+        else
+          DEPLOY_CMD="$DEPLOY_CMD --source-dir ${{ inputs.source_path }}"
+        fi
+
+        # Add test parameters
+        TESTS_ENABLED="false"
+        if [ "${{ inputs.test_level }}" != "NoTestRun" ]; then
+          TESTS_ENABLED="true"
+          DEPLOY_CMD="$DEPLOY_CMD --test-level ${{ inputs.test_level }}"
+          DEPLOY_CMD="$DEPLOY_CMD --coverage-formatters html-spa --coverage-formatters json-summary"
+          
+          if [ "${{ inputs.test_level }}" = "RunSpecifiedTests" ]; then
+            if [ -z "${{ inputs.specified_tests }}" ]; then
+              log_failure "Specified tests required for RunSpecifiedTests level"
+              exit 1
+            fi
+            DEPLOY_CMD="$DEPLOY_CMD --tests ${{ inputs.specified_tests }}"
+            log_info "🎯 Running specified tests: ${{ inputs.specified_tests }}"
+          fi
+        fi
+
+        log_command "Executing deployment" "$DEPLOY_CMD"
+
+        # Execute deployment
+        set +e
+        $DEPLOY_CMD > deploy_cmd_output.log 2>&1
+        DEPLOY_EXIT_CODE=$?
+        set -e
+
+        log_info "Deployment completed with exit code: $DEPLOY_EXIT_CODE"
+
+        # --- FIX START: Print raw error if CLI failed ---
+        if [ $DEPLOY_EXIT_CODE -ne 0 ]; then
+          echo "⚠️  CLI Command exited with error. Raw output:"
+          echo "----------------------------------------"
+          cat deploy_cmd_output.log
+          echo "----------------------------------------"
+        fi
+        # --- FIX END ---
+
+        # Validate result file
+        if [ ! -f "deploy_cmd_output.log" ]; then
+          log_failure "Deployment result file not created"
+          echo '{"result":{"id":"unknown","status":"Failed","deployUrl":""}}' > deploy_cmd_output.log
+        fi
+
+
+        RAW_INPUT="deploy_cmd_output.log"        
+        PROCESSED_OUTPUT="deployment_result.json"
+        # Check if the file is already a valid JSON
+        if jq empty "$RAW_INPUT" 2>/dev/null; then
+            echo "Input file '$RAW_INPUT' is already valid JSON. Copying to '$PROCESSED_OUTPUT'."
+            cp "$RAW_INPUT" "$PROCESSED_OUTPUT"
+        else
+            echo "Input file '$RAW_INPUT' is not valid JSON. Attempting to extract JSON content..."
+            echo "Extracting JSON from $RAW_INPUT..."
+
+
+            echo "Step 1: Stripping content before first '{'"
+            awk 'found || /{/ {found=1; print}' "$RAW_INPUT" > temp_step1.txt
+
+            # Step 2: Find the last '}' and strip everything after it  
+            echo "Step 2: Stripping content after last '}'"
+            tac temp_step1.txt | awk 'found || /}/ {found=1; print}' | tac > temp_step2.txt
+
+            # Step 3: Validate and format with jq
+            echo "Step 3: Validating JSON with jq..."
+            if jq . temp_step2.txt > "$PROCESSED_OUTPUT" 2>/dev/null; then
+                echo "✅ Success! Valid JSON extracted to: $PROCESSED_OUTPUT"
+
+                # Show some stats
+                echo ""
+                echo "📊 JSON Stats:"
+                echo "Lines: $(wc -l < "$PROCESSED_OUTPUT")"
+                echo "Size: $(du -h "$PROCESSED_OUTPUT" | cut -f1)"
+            else
+                echo "❌ Error: Extracted content is not valid JSON"
+                echo "Saving raw extracted content to: ${PROCESSED_OUTPUT}.raw"
+                cp temp_step2.txt "${PROCESSED_OUTPUT}.raw"
+
+                echo ""
+                echo "🔧 Attempting to fix common JSON issues..."
+
+                # Try to fix common issues like trailing commas
+                # Remove trailing commas before } or ]
+                sed -e 's/,\([[:space:]]*[}\]]\)/\1/g' temp_step2.txt > temp_fixed.txt
+
+                if jq . temp_fixed.txt > "$PROCESSED_OUTPUT" 2>/dev/null; then
+                    echo "✅ Fixed! Valid JSON saved to: $PROCESSED_OUTPUT"
+                else
+                    echo "❌ Could not auto-fix. Manual inspection needed."
+                    echo "Raw content saved in: ${PROCESSED_OUTPUT}.raw"
+                fi
+            fi
+            # Cleanup temporary files
+            rm -f temp_step1.txt temp_step2.txt temp_fixed.txt
+        fi
+
+
+        # Parse deployment results
+        DEPLOY_RESULT=$(cat deployment_result.json)
+
+        # Extract core deployment info
+        DEPLOY_ID=$(parse_json '.result.id' 'unknown')
+        STATUS=$(parse_json '.result.status' 'Failed')
+        DEPLOY_URL=$(parse_json '.result.deployUrl' '')
+
+        # Extract component metrics
+        COMPONENT_ERRORS=$(parse_json '.result.numberComponentErrors' '0')
+        COMPONENTS_DEPLOYED=$(parse_json '.result.numberComponentsDeployed' '0')
+        COMPONENTS_TOTAL=$(parse_json '.result.numberComponentsTotal' '0')
+
+        # Extract test metrics
+        TEST_ERRORS=$(parse_json '.result.numberTestErrors' '0')
+        TESTS_COMPLETED=$(parse_json '.result.numberTestsCompleted' '0')
+        TESTS_TOTAL=$(parse_json '.result.numberTestsTotal' '0')
+
+        # Extract coverage info
+        COVERAGE_PERCENTAGE="0"
+        if [ "$TESTS_ENABLED" = "true" ]; then
+          # Try different coverage paths with division by zero protection
+          COVERAGE_PERCENTAGE=$(echo "$DEPLOY_RESULT" | jq '[.result.details.runTestResult.codeCoverage[]?] 
+            | map({covered: (.numLocations - .numLocationsNotCovered), total: .numLocations}) 
+            | reduce .[] as $line ({covered:0, total:0}; 
+                {covered: (.covered + $line.covered), total: (.total + $line.total)}) 
+            | if .total > 0 then (.covered * 100 / .total) else 0 end')
+          if [ "$COVERAGE_PERCENTAGE" = "0" ]; then
+            # Alternative coverage extraction from warnings
+            COVERAGE_WARNINGS=$(echo "$DEPLOY_RESULT" | jq -r '.result.details.runTestResult.codeCoverageWarnings[]?.message // empty' 2>/dev/null | tr '\n' '; ')
+            if [ -n "$COVERAGE_WARNINGS" ]; then
+              COVERAGE_PERCENTAGE=$(echo "$COVERAGE_WARNINGS" | grep -o 'is [0-9]\+%' | grep -o '[0-9]\+' | head -1 || echo "0")
+            fi
+          fi
+        fi
+
+        # Determine overall status
+        DEPLOY_STATUS="failed"
+        if [[ "$(echo "$STATUS" | tr '[:upper:]' '[:lower:]')" =~ ^(succeeded|success)$ ]]; then
+          DEPLOY_STATUS="success"
+          log_success "${{ inputs.operation_type }} completed successfully"
+        else
+          log_failure "${{ inputs.operation_type }} failed"
+        fi
+
+        # Set conditional flags for subsequent steps
+        HAS_COMPONENT_ERRORS="false"
+        if [ "$COMPONENT_ERRORS" -gt 0 ]; then
+          HAS_COMPONENT_ERRORS="true"
+        fi
+
+        # Determine if tests were actually executed (not just enabled)
+        TESTS_EXECUTED="false"
+        if [ "$TESTS_ENABLED" = "true" ] && [ "$TESTS_TOTAL" -gt 0 ]; then
+          TESTS_EXECUTED="true"
+        fi
+
+        # Build test results summary
+        TEST_RESULTS="no-tests"
+        if [ "$TESTS_EXECUTED" = "true" ]; then
+          TEST_PASSED=$((TESTS_COMPLETED - TEST_ERRORS))
+          TEST_RESULTS="passed:${TEST_PASSED},failed:${TEST_ERRORS},total:${TESTS_TOTAL}"
+        fi
+
+        # Display deployment report
+        if [ "$DEPLOY_ID" != "unknown" ]; then
+          log_info "📊 Deployment Report:"
+          sf project deploy report --job-id "$DEPLOY_ID" || log_warning "Could not retrieve deployment report"
+        fi
+
+        # Prominent deployment URL
+        if [ -n "$DEPLOY_URL" ]; then
+          log_success "🔗 Deployment URL: $DEPLOY_URL"
+          echo "::notice title=🔗 Deployment URL::${DEPLOY_URL}"
+        fi
+
+        # Set all outputs
+        echo "deploy_status=$DEPLOY_STATUS" >> $GITHUB_OUTPUT
+        echo "deploy_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+        echo "deploy_url=$DEPLOY_URL" >> $GITHUB_OUTPUT
+        echo "coverage_percentage=$COVERAGE_PERCENTAGE" >> $GITHUB_OUTPUT
+        echo "test_results=$TEST_RESULTS" >> $GITHUB_OUTPUT
+        echo "has_component_errors=$HAS_COMPONENT_ERRORS" >> $GITHUB_OUTPUT
+        echo "tests_executed=$TESTS_EXECUTED" >> $GITHUB_OUTPUT
+        echo "component_errors=$COMPONENT_ERRORS" >> $GITHUB_OUTPUT
+        echo "components_total=$COMPONENTS_TOTAL" >> $GITHUB_OUTPUT
+        echo "test_failures=$TEST_ERRORS" >> $GITHUB_OUTPUT
+        echo "tests_total=$TESTS_TOTAL" >> $GITHUB_OUTPUT
+
+        # Store metrics for subsequent steps
+        echo "COMPONENT_ERRORS=$COMPONENT_ERRORS" >> $GITHUB_ENV
+        echo "COMPONENTS_DEPLOYED=$COMPONENTS_DEPLOYED" >> $GITHUB_ENV
+        echo "COMPONENTS_TOTAL=$COMPONENTS_TOTAL" >> $GITHUB_ENV
+        echo "TEST_ERRORS=$TEST_ERRORS" >> $GITHUB_ENV
+        echo "TESTS_COMPLETED=$TESTS_COMPLETED" >> $GITHUB_ENV
+        echo "TESTS_TOTAL=$TESTS_TOTAL" >> $GITHUB_ENV
+
+        # Generate initial summary
+        {
+          echo "# 🚀 Deployment Results"
+          echo ""
+          if [ "$DEPLOY_STATUS" = "success" ]; then
+            echo "✅ **Operation: ${{ inputs.operation_type }} completed successfully!**"
+          else
+            echo "❌ **Operation: ${{ inputs.operation_type }} failed**"
+          fi
+          echo ""
+          echo "| Metric | Value |"
+          echo "|--------|-------|"
+          echo "| 🆔 Deployment ID | \`$DEPLOY_ID\` |"
+          echo "| 🧩 Components | $COMPONENTS_DEPLOYED/$COMPONENTS_TOTAL deployed |"
+          
+          if [ "$TESTS_EXECUTED" = "true" ]; then
+            echo "| 🧪 Tests | $TESTS_COMPLETED/$TESTS_TOTAL completed |"
+            echo "| 📈 Coverage | ${COVERAGE_PERCENTAGE}% |"
+          fi
+          
+          if [ -n "$DEPLOY_URL" ]; then
+            echo ""
+            echo "## 🔗 Deployment URL:"
+            echo " "
+            echo "<div align=\"center\"><bold><strong>👉 <a href=\"$DEPLOY_URL\" target=\"_blank\">View Deployment in Salesforce Instance</a></strong></bold></div>"
+            echo " "
+          fi
+          echo ""
+        } >> $GITHUB_STEP_SUMMARY
+
+        log_info "📋 Summary: Status=$DEPLOY_STATUS, ID=$DEPLOY_ID, Components=$COMPONENTS_DEPLOYED/$COMPONENTS_TOTAL"
+
+    - name: 🔧 Analyze Component Errors
+      if: steps.execute.outputs.has_component_errors == 'true'
+      shell: bash
+      run: |
+        log_warning "🔧 Analyzing component errors..."
+
+        # Parse component failures
+        DEPLOY_RESULT=$(cat deployment_result.json)
+
+        # Extract component error details for logging
+        COMPONENT_FAILURES=$(echo "$DEPLOY_RESULT" | jq -r '.result.details.componentFailures[]? | "• \(.fullName) (\(.componentType)): \(.problem)"' 2>/dev/null || echo "• Unable to parse component failures")
+
+        # Extract component errors for table display
+        COMPONENT_ERRORS_JSON=$(echo "$DEPLOY_RESULT" | jq -c '.result.details.componentFailures[]?' 2>/dev/null || echo "")
+
+        log_failure "Component Errors Found:"
+        echo " "
+        echo "$COMPONENT_FAILURES"
+        echo " "
+
+        # Log structured JSON for debugging
+        if [ -n "$COMPONENT_ERRORS_JSON" ]; then
+          log_info "📋 Structured component error details:"
+          echo "$COMPONENT_ERRORS_JSON" | while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              echo "$line" | jq '.'
+            fi
+          done
+        fi
+
+        # Mermaid chart for visual summary
+        COMPONENTS_PIE_CHART=$(cat <<EOF
+        \`\`\`mermaid
+        pie showData
+          title Components
+          "Errors" : $COMPONENT_ERRORS
+          "Success" : $COMPONENTS_DEPLOYED
+        \`\`\`
+        EOF
+        )
+
+        # Add detailed component error analysis to summary
+        {
+          echo "## 🔧 Component Error Details"
+          echo ""
+          echo "$COMPONENTS_PIE_CHART"
+          echo ""
+          echo "|  Type     | Component | Problem | Problem Type |"
+          echo "|-----------|-----------|---------|--------------|"
+          echo "$DEPLOY_RESULT" | jq -r '.result.details.componentFailures[]? 
+            | "| \(.componentType // "unknown") | \(.fullName // "unknown") | \(.problem // "unknown") | \(.problemType // "Error") |"' 2>/dev/null || echo "| Unable to parse | component failures | - | - |"
+          echo ""
+          echo "**$COMPONENT_ERRORS component(s) failed to deploy**"
+          echo ""
+          
+          echo "💡 **Fix Components**: Review the errors above and fix the indicated issues in your source code."
+          echo ""
+        } >> $GITHUB_STEP_SUMMARY
+
+    - name: 🧪 Analyze Test Results & Coverage
+      if: steps.execute.outputs.tests_executed == 'true'
+      shell: bash
+      run: |
+        log_info "🧪 Analyzing test results and coverage..."
+
+        DEPLOY_RESULT=$(cat deployment_result.json)
+        COVERAGE_THRESHOLD="${{ inputs.coverage_threshold }}"
+
+        # Extract test details
+        TEST_SUCCESSES=$(echo "$DEPLOY_RESULT" | jq -r '.result.details.runTestResult.successes[]? | "✅ \(.name).\(.methodName) (\(.time)ms)"' 2>/dev/null || echo "")
+        TEST_FAILURES=$(echo "$DEPLOY_RESULT" | jq -r '.result.details.runTestResult.failures[]? | "❌ \(.name).\(.methodName): \(.message)"' 2>/dev/null || echo "")
+
+        # Log detailed test failures in console (list format)
+        if [ -n "$TEST_FAILURES" ]; then
+          log_failure "Test Failures Found:"
+          echo " "
+          echo "$TEST_FAILURES"
+          echo " "
+          
+          # Log structured JSON for debugging
+          TEST_FAILURES_JSON=$(echo "$DEPLOY_RESULT" | jq -c '.result.details.runTestResult.failures[]?' 2>/dev/null || echo "")
+          if [ -n "$TEST_FAILURES_JSON" ]; then
+            log_info "📋 Structured test failure details:"
+            echo "$TEST_FAILURES_JSON" | while IFS= read -r line; do
+              if [ -n "$line" ]; then
+                echo "$line" | jq '.'
+              fi
+            done
+          fi
+        fi
+
+        # Coverage analysis
+        COVERAGE_DETAILS=$(echo "$DEPLOY_RESULT" | jq -r '.result.details.runTestResult.codeCoverage[]? | 
+          "• \(.name): \(.numLocationsNotCovered)/\(.numLocations) uncovered (" + 
+          ((((.numLocations - .numLocationsNotCovered) * 100) / .numLocations) | floor | tostring) + "%)"' 2>/dev/null || echo "")
+        COVERAGE_WARNINGS=$(echo "$DEPLOY_RESULT" | jq -r '.result.details.runTestResult.codeCoverageWarnings[]?.message // empty' 2>/dev/null || echo "")
+
+        # Compute detailed coverage statistics
+        COVERAGE="${{ steps.execute.outputs.coverage_percentage }}"
+
+        COVERED=$(echo "$DEPLOY_RESULT" | jq '[.result.details.runTestResult.codeCoverage[]?] 
+          | map(.numLocations - .numLocationsNotCovered) 
+          | add')
+        UNCOVERED=$(echo "$DEPLOY_RESULT" | jq '[.result.details.runTestResult.codeCoverage[]?] 
+          | map(.numLocationsNotCovered) 
+          | add')
+        TOTAL=$((COVERED + UNCOVERED))
+
+        # Determine test and coverage status
+        TEST_STATUS="success"
+        COVERAGE_STATUS="success"
+
+        if [ "$TEST_ERRORS" -gt 0 ]; then
+          TEST_STATUS="failed"
+          log_failure "$TEST_ERRORS test(s) failed"
+        else
+          log_success "All $TESTS_COMPLETED tests passed"
+        fi
+
+        log_info "Total Covered: $COVERED, Uncovered: $UNCOVERED, Overall: $COVERAGE%"
+
+        # Convert decimal coverage to integer for bash comparison
+        COVERAGE_INT=$(echo "${{ steps.execute.outputs.coverage_percentage }}" | cut -d'.' -f1)
+        if [ "$COVERAGE_INT" -lt "$COVERAGE_THRESHOLD" ]; then
+          COVERAGE_STATUS="failed"
+          COVERAGE_GAP=$((COVERAGE_THRESHOLD - COVERAGE_INT))
+          log_failure "Coverage ${{ steps.execute.outputs.coverage_percentage }}% below threshold ${COVERAGE_THRESHOLD}% (missing ${COVERAGE_GAP}%)"
+          echo "::error title=Code coverage threshold::Current code coverage ${{ steps.execute.outputs.coverage_percentage }}% is below required threshold of ${COVERAGE_THRESHOLD}% - need at least ${COVERAGE_GAP}% more coverage"
+        else
+          log_success "Coverage ${{ steps.execute.outputs.coverage_percentage }}% meets threshold ${COVERAGE_THRESHOLD}%"
+        fi
+
+        # Mermaid chart for visual summary
+        PIE_CHART=$(cat <<EOF
+        \`\`\`mermaid
+        pie showData
+          title Apex Coverage Breakdown
+          "Covered" : $COVERED
+          "Uncovered" : $UNCOVERED
+        \`\`\`
+        EOF
+        )
+
+        # Generate comprehensive test and coverage summary
+        {
+          echo "## 🧪 Test Execution & Coverage Details"
+          echo ""
+          
+          echo "**Total Coverage:** $COVERAGE% ($COVERED of $TOTAL lines)"
+          echo "$PIE_CHART"
+          echo ""
+          echo "| Metric | Value |"
+          echo "|--------|-------|"
+          echo "| ✅ Passed | $((TESTS_COMPLETED - TEST_ERRORS)) |"
+          echo "| ❌ Failed | $TEST_ERRORS |"
+          echo "| 📊 Total Tests | $TESTS_TOTAL |"
+          echo "| 📈 Coverage | ${COVERAGE}% |"
+          echo "| 🎯 Threshold | ${COVERAGE_THRESHOLD}% |"
+          echo "| 📦 Covered Lines | $COVERED |"
+          echo "| ❌ Uncovered Lines | $UNCOVERED |"
+          echo "| 📊 Total Lines | $TOTAL |"
+          echo ""
+          
+          if [ -n "$TEST_SUCCESSES" ]; then
+            echo "<details><summary>✅ Passed Tests ($((TESTS_COMPLETED - TEST_ERRORS)))</summary>"
+            echo ""
+            echo "\`\`\`"
+            echo "$TEST_SUCCESSES"
+            echo "\`\`\`"
+            echo "</details>"
+            echo ""
+          fi
+          
+          if [ -n "$TEST_FAILURES" ]; then
+            echo "### ❌ Failed Tests ($TEST_ERRORS)"
+            echo ""
+            echo "| Class Name | Method Name | Message | Stack Trace |"
+            echo "|------------|-------------|---------|-------------|"
+            echo "$DEPLOY_RESULT" | jq -r '.result.details.runTestResult.failures[]? 
+              | "| \(.name // "unknown") | \(.methodName // "unknown") | \(.message // "unknown") | \(.stackTrace // "unknown") |"' 2>/dev/null || echo "| Unable to parse | test failures | - | - |"
+            echo ""
+          fi
+          
+          echo "<details><summary>📈 Coverage by Class</summary>"
+          echo " "
+          echo "| Name | Covered | Uncovered | % Covered |"
+          echo "|------|---------|-----------|-----------|"
+          echo "$DEPLOY_RESULT" | jq -r '.result.details.runTestResult.codeCoverage[]? 
+            | "| \(.name) | \((.numLocations - .numLocationsNotCovered)) | \(.numLocationsNotCovered) | " + 
+            ((((.numLocations - .numLocationsNotCovered) * 100) / .numLocations) | floor | tostring) + "% |"'
+          echo ""
+          echo "</details>"
+          echo ""
+         
+          # Coverage warnings and recommendations
+          if [ "$COVERAGE_STATUS" = "failed" ]; then
+            echo "### ⚠️ Coverage Issues"
+            echo ""
+            if [ -n "$COVERAGE_WARNINGS" ]; then
+              echo "$COVERAGE_WARNINGS"
+            fi
+            echo ""
+            echo "💡 **Improve Coverage**: Add more test methods or improve existing tests to increase coverage above ${COVERAGE_THRESHOLD}%"
+            echo ""
+          fi
+          
+          # Test failure recommendations
+          if [ "$TEST_STATUS" = "failed" ]; then
+            echo "### ⚠️ Test Failures"
+            echo ""
+            echo "💡 **Fix Tests**: Review the failed test methods above and fix the underlying issues."
+            echo ""
+          fi
+          
+        } >> $GITHUB_STEP_SUMMARY
+
+        # Fail the step if coverage is below threshold
+        if [ "$COVERAGE_STATUS" = "failed" ]; then
+          exit 1
+        fi
+
+    - name: 🎯 Final Status Check
+      if: always()
+      shell: bash
+      run: |
+        log_info "🎯 Final deployment status check..."
+
+        FINAL_STATUS="${{ steps.execute.outputs.deploy_status }}"
+
+        if [ "$FINAL_STATUS" = "success" ]; then
+          log_success "✅ Deployment completed successfully!"
+        else
+          log_failure "❌ Deployment failed"
+          
+          # Create error summary
+          ERROR_MESSAGE="Operation - ${{ inputs.operation_type }} failed"
+          ERROR_TITLE="${{ inputs.operation_type }}"
+          if [ "${{ steps.execute.outputs.has_component_errors }}" = "true" ]; then
+            ERROR_MESSAGE="$ERROR_MESSAGE - Component errors: $COMPONENT_ERRORS"
+            ERROR_TITLE="Component errors"
+          fi
+          if [ "${{ steps.execute.outputs.tests_executed }}" = "true" ] && [ "$TEST_ERRORS" -gt 0 ]; then
+            ERROR_MESSAGE="$ERROR_MESSAGE - Test failures: $TEST_ERRORS"
+            ERROR_TITLE="Test failures"
+          fi
+
+          echo "::error title=$ERROR_TITLE::$ERROR_MESSAGE"
+          exit 1
+        fi

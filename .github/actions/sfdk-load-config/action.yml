@@ -1,0 +1,112 @@
+name: "SFDK -Load Salesforce Configuration"
+description: "Loads branch-specific configuration without any setup or authentication"
+
+outputs:
+  # GitHub environment
+  gh_environment:
+    description: "GitHub environment name"
+    value: ${{ steps.config.outputs.gh_environment }}
+  # Salesforce config
+  sf_target_environment:
+    description: "Salesforce target environment"
+    value: ${{ steps.config.outputs.sf_target_environment }}
+  sf_instance_url:
+    description: "Salesforce instance URL"
+    value: ${{ steps.config.outputs.sf_instance_url }}
+  sf_username:
+    description: "Salesforce username"
+    value: ${{ steps.config.outputs.sf_username }}
+  sf_test_level:
+    description: "Test level for deployments"
+    value: ${{ steps.config.outputs.sf_test_level }}
+  sf_test_level_pr:
+    description: "Test level for PR validations"
+    value: ${{ steps.config.outputs.sf_test_level_pr }}
+  sf_coverage_threshold:
+    description: "Code coverage threshold percentage"
+    value: ${{ steps.config.outputs.sf_coverage_threshold }}
+  sf_code_analysis_enabled:
+    description: "Enable code analysis"
+    value: ${{ steps.config.outputs.sf_code_analysis_enabled }}
+  sf_code_analysis_threshold:
+    description: "Code analysis threshold"
+    value: ${{ steps.config.outputs.sf_code_analysis_threshold }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Load branch configuration
+      id: config
+      shell: bash
+      run: |
+        echo "🔍 Determining config based on GitHub context"
+
+        # Determine which branch config to load
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          BRANCH="${{ github.base_ref }}"
+          echo "📋 PR detected: loading config for target branch '$BRANCH'"
+        else
+          BRANCH="${{ github.ref_name }}"
+          echo "🚀 Push detected: loading config for branch '$BRANCH'"
+        fi
+
+        # Handle release branches (e.g., release/1.0 -> release)
+        if [[ "$BRANCH" == release/* ]]; then
+          BRANCH="release"
+          echo "🔄 Release branch detected: using 'release' config"
+        fi
+
+        CONFIG_FILE=".env/$BRANCH/config.env"
+        echo "📁 Loading config from: $CONFIG_FILE"
+
+        if [[ -f "$CONFIG_FILE" ]]; then
+          # Load config and set outputs
+          source "$CONFIG_FILE"
+          
+          echo "gh_environment=${GH_ENVIRONMENT}" >> $GITHUB_OUTPUT
+          echo "sf_target_environment=${SF_TARGET_ENVIRONMENT}" >> $GITHUB_OUTPUT
+          echo "sf_instance_url=${SF_INSTANCE_URL}" >> $GITHUB_OUTPUT
+          echo "sf_username=${SF_USERNAME}" >> $GITHUB_OUTPUT
+          echo "sf_test_level=${SF_TEST_LEVEL}" >> $GITHUB_OUTPUT
+          echo "sf_test_level_pr=${SF_TEST_LEVEL_PR}" >> $GITHUB_OUTPUT
+          echo "sf_coverage_threshold=${SF_TEST_CODE_COVERAGE_THRESHOLD}" >> $GITHUB_OUTPUT
+          echo "sf_code_analysis_enabled=${SF_CODE_ANALYSIS_ENABLED}" >> $GITHUB_OUTPUT
+          echo "sf_code_analysis_threshold=${SF_CODE_ANALYSIS_THRESHOLD}" >> $GITHUB_OUTPUT
+
+          echo "✅ Config loaded successfully"
+          echo "🎯 Environment: $SF_TARGET_ENVIRONMENT"
+          echo "👤 Username: $SF_USERNAME"
+          echo "🌐 Instance URL: $SF_INSTANCE_URL"
+
+          {
+            echo "# Setup Configuration"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| 🎯 Environment | $SF_TARGET_ENVIRONMENT |"
+            echo "| 🎯 GitHub Environment | $GH_ENVIRONMENT |"
+            echo "| 👤 Salesforce Username | $SF_USERNAME |"
+            echo "| 🔗 Salesforce Instance URL | $SF_INSTANCE_URL |"
+            echo "| 🧪 Test Level | $SF_TEST_LEVEL |"
+            echo "| 🧪 Test Level PR | $SF_TEST_LEVEL_PR |"
+            echo "| 📊 Code Coverage Threshold | $SF_TEST_CODE_COVERAGE_THRESHOLD |"
+            echo "| 🔍 Code Analysis Enabled | $SF_CODE_ANALYSIS_ENABLED |"
+            echo "| 📊 Code Analysis Threshold | $SF_CODE_ANALYSIS_THRESHOLD |"
+            echo "| 🔄 Branch | $BRANCH |"
+            echo "| 🔍 Config File | $CONFIG_FILE |"
+            echo "| 📂 Config Directory | .env/$BRANCH/ |"
+            echo "" 
+          } >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Config file not found: $CONFIG_FILE"
+          echo "📂 Available configs:"
+          echo "```"
+          echo "$(ls -la .env/)"
+          echo "```"
+          echo "::error::Configuration file not found for branch '$BRANCH'. Please ensure the .env directory contains the correct config files."
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## ❌ Configuration Error" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          ls -la .env/ 2>/dev/null || echo "No .env directory found"
+          exit 1
+        fi

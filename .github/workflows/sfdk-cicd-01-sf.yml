@@ -1,0 +1,216 @@
+name: "SFDK - Salesforce CI/CD Reusable Workflow"
+# description: "Streamlined reusable workflow using optimized SFDK actions"
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      # Authentication inputs
+      auth_method:
+        description: "Authentication method (jwt, sfdx-url)"
+        required: false
+        default: "sfdx-url"
+        type: string
+      sf_username:
+        description: "Salesforce username"
+        required: true
+        type: string
+      sf_instance_url:
+        description: "Salesforce instance URL"
+        required: true
+        type: string
+
+      # Operation inputs
+      operation_type:
+        description: "Operation type (deploy, validate, deploy-quick)"
+        required: false
+        default: "validate"
+        type: string
+      source_path:
+        description: "Source path for deployment"
+        required: false
+        default: "force-app"
+        type: string
+      manifest_path:
+        description: "Path to package.xml manifest"
+        required: false
+        type: string
+
+      # Test inputs
+      test_level:
+        description: "Test level (NoTestRun, RunSpecifiedTests, RunLocalTests, RunAllTestsInOrg)"
+        required: false
+        default: "RunLocalTests"
+        type: string
+      specified_tests:
+        description: "Comma-separated list of test classes to run"
+        required: false
+        type: string
+      coverage_threshold:
+        description: "Code coverage threshold percentage"
+        required: false
+        type: string
+
+      # Code scanning inputs
+      enable_code_scan:
+        description: "Enable code scanning"
+        required: false
+        default: true
+        type: boolean
+      scan_severity_threshold:
+        description: "Code scan severity threshold (1-5)"
+        required: false
+        default: "3"
+        type: string
+      fail_on_scan_violations:
+        description: "Fail on code scan violations"
+        required: false
+        default: false
+        type: boolean
+
+      # Docker inputs
+      docker_image:
+        description: "Docker image to use"
+        required: false
+        default: "ghcr.io/gsa-gen/crm-agdigipolis-pipeline/crm-agdigipolis-pipeline:latest"
+        type: string
+
+      # Workflow options
+      wait_time:
+        description: "Wait time in minutes"
+        required: false
+        default: "30"
+        type: string
+      quick_deploy_id:
+        description: "Quick deploy ID for deploy-quick operation"
+        required: false
+        type: string
+      github_environment:
+        description: "GitHub environment for deployment approval"
+        required: false
+        type: string
+
+    secrets:
+      SF_CLIENT_ID:
+        description: "Salesforce connected app client ID"
+        required: false
+      SF_PRIVATE_KEY:
+        description: "JWT private key for authentication"
+        required: false
+      SFDX_AUTH_URL:
+        description: "SFDX auth URL for authentication"
+        required: false
+
+    outputs:
+      deployment_id:
+        description: "Deployment ID from the operation"
+        value: ${{ jobs.sf-ci-cd.outputs.deployment_id }}
+      deployment_url:
+        description: "Deployment URL from the operation"
+        value: ${{ jobs.sf-ci-cd.outputs.deployment_url }}
+      deployment_status:
+        description: "Final deployment status"
+        value: ${{ jobs.sf-ci-cd.outputs.deployment_status }}
+      test_coverage:
+        description: "Test coverage percentage"
+        value: ${{ jobs.sf-ci-cd.outputs.test_coverage }}
+      scan_violations:
+        description: "Number of code scan violations"
+        value: ${{ jobs.sf-ci-cd.outputs.scan_violations }}
+
+jobs:
+  sf-ci-cd:
+    name: 🚀 Salesforce CI/CD Pipeline
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
+    container:
+      image: ${{ inputs.docker_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    outputs:
+      deployment_id: ${{ steps.deploy.outputs.deploy_id }}
+      deployment_url: ${{ steps.deploy.outputs.deploy_url }}
+      deployment_status: ${{ steps.deploy.outputs.deploy_status }}
+      test_coverage: ${{ steps.deploy.outputs.coverage_percentage }}
+      scan_violations: ${{ steps.scan.outputs.violations_count }}
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔐 Authenticate to Salesforce
+        id: auth
+        uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-authenticate@v2
+        with:
+          auth_method: ${{ inputs.auth_method }}
+          sf_username: ${{ inputs.sf_username }}
+          sf_instance_url: ${{ inputs.sf_instance_url }}
+          sf_client_id: ${{ secrets.SF_CLIENT_ID }}
+          sf_private_key: ${{ secrets.SF_PRIVATE_KEY }}
+          sfdx_auth_url: ${{ secrets.SFDX_AUTH_URL }}
+          target_org_alias: "target-org"
+
+      - name: 🔍 Run Code Analysis
+        id: scan
+        if: inputs.enable_code_scan
+        uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-sf-code-analyze@v2
+        with:
+          source_path: ${{ inputs.source_path }}
+          severity_threshold: ${{ inputs.scan_severity_threshold }}
+          fail_on_violations: ${{ inputs.fail_on_scan_violations }}
+          target_org: "target-org"
+
+      - name: 🚀 Execute Salesforce Operation
+        id: deploy
+        # uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-deploy-and-parse@v2
+        uses: gsa-gen/crm-agdigipolis-pipeline/.github/actions/sfdk-sf-project-deploy@v2
+        with:
+          operation_type: ${{ inputs.operation_type }}
+          target_org: "target-org"
+          source_path: ${{ inputs.source_path }}
+          manifest_path: ${{ inputs.manifest_path }}
+          test_level: ${{ inputs.test_level }}
+          specified_tests: ${{ inputs.specified_tests }}
+          wait_time: ${{ inputs.wait_time }}
+          quick_deploy_id: ${{ inputs.quick_deploy_id }}
+          coverage_threshold: ${{ inputs.coverage_threshold }}
+
+      - name: 📂 Upload Pipeline Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfdk-pipeline-results-${{ github.run_id }}
+          path: |
+            deployment_result.json
+            code-analysis-results.*
+            coverage/
+          retention-days: 30
+
+      - name: 🎯 Final Status Check
+        if: always()
+        shell: bash
+        run: |
+          log_info "🎯 Pipeline Status Summary"
+          echo "=========================="
+          echo "🔐 Auth: ${{ steps.auth.outputs.auth_status }}"
+          echo "🔍 Scan: ${{ steps.scan.outputs.scan_status || 'not-run' }} (${{ steps.scan.outputs.violations_count || '0' }} violations)"
+          echo "🚀 Deploy: ${{ steps.deploy.outputs.deploy_status }}"
+          echo ""
+
+          if [ "${{ steps.deploy.outputs.deploy_url }}" != "" ]; then
+            echo "🔗 Deployment URL: ${{ steps.deploy.outputs.deploy_url }}"
+          fi
+
+          # Determine overall status and fail if deployment failed
+          if [ "${{ steps.deploy.outputs.deploy_status }}" = "failed" ]; then
+            log_failure "Pipeline failed due to deployment failure"
+            exit 1
+          elif [ "${{ steps.scan.outputs.scan_status || 'success' }}" = "failed" ]; then
+            log_warning "Pipeline completed with scan violations"
+          else
+            log_success "Pipeline completed successfully"
+          fi
